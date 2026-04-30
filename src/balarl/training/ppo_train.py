@@ -3,32 +3,34 @@
 from __future__ import annotations
 
 import json
+import platform
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import List
 
 import numpy as np
 import torch
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.callbacks import (
-    CallbackList, CheckpointCallback, EvalCallback,
+    BaseCallback, CallbackList, CheckpointCallback,
 )
 
 from balarl.env.balatro_env import BalatroEnv
 from balarl.training.feature_extractor import BalatroFeatureExtractor
-from balarl.training.config import TrainingConfig, QUICK_TEST_CONFIG
-from balarl.training.curriculum import CurriculumScheduler
-from balarl.training.callbacks import BalatroMetricsCallback, TrainingLogger
+from balarl.training.config import TrainingConfig
 
+
+# ═══════════════════════════════════════════════════════════════
+# Picklable environment factory (must be module-level for SubprocVecEnv)
+# ═══════════════════════════════════════════════════════════════
+
+IS_LINUX = platform.system() == "Linux"
 
 class CurriculumEnvWrapper(gym.Wrapper):
-    """Wraps BalatroEnv to enforce curriculum max ante."""
-
     def __init__(self, env: BalatroEnv, max_ante: int = 8):
         super().__init__(env)
         self._max_ante = max_ante
@@ -42,54 +44,103 @@ class CurriculumEnvWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        # Terminate if exceeding curriculum max
         if hasattr(self.env, 'state') and self.env.state.ante > self._max_ante:
             terminated = True
             info["curriculum_limit"] = True
         return obs, reward, terminated, truncated, info
 
 
-def make_env(seed: int, max_ante: int = 8, rank: int = 0) -> callable:
-    """Create a factory for BalatroEnv with curriculum wrapper."""
-    def _init():
-        env = BalatroEnv(seed=seed + rank)
-        if max_ante < 100:
-            env = CurriculumEnvWrapper(env, max_ante)
-        env = Monitor(env)
-        return env
-    return _init
+# Global state for env factory (set by train_ppo before creating vec env)
+_ENV_SEED = 42
+_ENV_MAX_ANTE = 8
 
 
-def create_vec_env(n_envs: int, seed: int, max_ante: int = 8, use_subproc: bool = False) -> gym.vector.VectorEnv:
-    """Create vectorized Balatro environments."""
-    env_fns = [make_env(seed, max_ante, i) for i in range(n_envs)]
+def _env_factory(idx: int) -> gym.Env:
+    """Module-level factory for SubprocVecEnv pickling."""
+    env = BalatroEnv(seed=_ENV_SEED + idx)
+    if _ENV_MAX_ANTE < 100:
+        env = CurriculumEnvWrapper(env, _ENV_MAX_ANTE)
+    env = Monitor(env)
+    return env
 
-    if use_subproc and n_envs > 1:
+
+def create_vec_env(n_envs: int, seed: int, max_ante: int = 8) -> gym.vector.VectorEnv:
+    """Create vectorized environments, using SubprocVecEnv on Linux."""
+    global _ENV_SEED, _ENV_MAX_ANTE
+    _ENV_SEED = seed
+    _ENV_MAX_ANTE = max_ante
+
+    if IS_LINUX and n_envs > 1:
+        # Use "fork" start method for speed on Linux
         try:
-            return SubprocVecEnv(env_fns)
-        except Exception:
-            pass
-    return DummyVecEnv(env_fns)
+            import multiprocessing as mp
+            ctx = mp.get_context("fork")
+            return SubprocVecEnv(
+                [_make_env_tuple(idx) for idx in range(n_envs)],
+                context=ctx,
+            )
+        except Exception as e:
+            print(f"  SubprocVecEnv failed ({e}), falling back to DummyVecEnv")
 
+    # DummyVecEnv fallback
+    return DummyVecEnv([_make_env_tuple(idx) for idx in range(n_envs)])
+
+
+def _make_env_tuple(idx: int):
+    """Returns (callable,) tuple for VecEnv construction."""
+    return lambda: _env_factory(idx)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stdout progress callback (prints training progress periodically)
+# ═══════════════════════════════════════════════════════════════
+
+class ProgressCallback(BaseCallback):
+    """Print training metrics to stdout every N steps."""
+
+    def __init__(self, print_freq: int = 1000):
+        super().__init__()
+        self.print_freq = print_freq
+        self._last_print = 0
+        self._ep_count = 0
+        self._ep_rewards: List[float] = []
+
+    def _on_step(self) -> bool:
+        if "dones" in self.locals:
+            dones = self.locals["dones"]
+            if isinstance(dones, np.ndarray):
+                dones = dones.tolist()
+            if not isinstance(dones, list):
+                dones = [dones]
+
+            for done in dones:
+                if done:
+                    self._ep_count += 1
+
+        if self.num_timesteps - self._last_print >= self.print_freq:
+            self._last_print = self.num_timesteps
+            elapsed = time.perf_counter() - getattr(self.model, '_start_time', time.perf_counter())
+            fps = int(self.num_timesteps / max(1, elapsed))
+            avg_reward = np.mean(self._ep_rewards[-20:]) if self._ep_rewards else 0.0
+            print(f"  [{self.num_timesteps:>10,} steps]  "
+                  f"fps={fps:>6}  "
+                  f"eps={self._ep_count:>6}  "
+                  f"reward={avg_reward:>8.1f}",
+                  flush=True)
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main training function
+# ═══════════════════════════════════════════════════════════════
 
 def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
-    """Run PPO training on Balatro.
-
-    Args:
-        config: Training configuration.
-
-    Returns:
-        Tuple of (trained_model, save_path).
-    """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = Path(config.model_dir) / f"ppo_{run_id}"
     save_path.mkdir(parents=True, exist_ok=True)
 
-    log_path = Path(config.log_dir) / f"ppo_{run_id}"
+    log_path = Path(config.log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
-
-    tb_path = Path(config.tensorboard_log) / f"ppo_{run_id}"
-    tb_path.mkdir(parents=True, exist_ok=True)
 
     # Save config
     with open(save_path / "config.json", "w") as f:
@@ -98,13 +149,11 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
 
     # Create environments
     max_ante = config.curriculum_max_ante if config.use_curriculum else 100
-    env = create_vec_env(config.n_envs, config.seed, max_ante, use_subproc=False)
+    print(f"  Creating {config.n_envs} envs (SubprocVecEnv={IS_LINUX})...", flush=True)
+    env = create_vec_env(config.n_envs, config.seed, max_ante)
+    print(f"  Env type: {type(env).__name__}", flush=True)
 
-    # Eval environment
-    # Eval environment (only used for final eval)
-    eval_env = create_vec_env(1, config.seed + 1000, 100, use_subproc=False)
-
-    # Build policy kwargs with feature extractor
+    # Policy
     policy_kwargs = {
         "features_extractor_class": BalatroFeatureExtractor,
         "features_extractor_kwargs": {"features_dim": config.features_dim},
@@ -114,7 +163,8 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
         },
     }
 
-    # Create model (no tensorboard for now)
+    # Model
+    print(f"  Creating PPO model (device={config.device})...", flush=True)
     model = PPO(
         "MultiInputPolicy",
         env,
@@ -131,49 +181,49 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,
         target_kl=config.target_kl,
-        tensorboard_log=None,  # Disabled for speed
+        tensorboard_log=None,
         device=config.device,
-        verbose=config.verbose,
+        verbose=0,  # We handle our own logging
     )
 
-    # Setup curriculum
-    curriculum = CurriculumScheduler() if config.use_curriculum else None
+    # Callbacks
+    callbacks = [
+        ProgressCallback(print_freq=config.log_freq),
+        CheckpointCallback(
+            save_freq=config.checkpoint_freq,
+            save_path=str(save_path / "checkpoints"),
+            name_prefix="ppo_balatro",
+        ),
+    ]
 
-    # Callbacks (lightweight)
-    callbacks = []
-
-    checkpoint_cb = CheckpointCallback(
-        save_freq=max(config.checkpoint_freq, config.total_timesteps),
-        save_path=str(save_path / "checkpoints"),
-        name_prefix="ppo_balatro",
-    )
-    callbacks.append(checkpoint_cb)
-
-    if config.verbose >= 1:
-        metrics_cb = BalatroMetricsCallback(str(log_path), log_freq=config.log_freq)
-        callbacks.append(metrics_cb)
-
-    # Train
-    print(f"\n{'='*60}")
-    print(f"Starting PPO training: {run_id}")
-    print(f"Total timesteps: {config.total_timesteps:,}")
-    print(f"Environments: {config.n_envs}")
-    print(f"Feature dim: {config.features_dim}")
-    print(f"Device: {config.device}")
-    print(f"Save path: {save_path}")
-    print(f"{'='*60}\n")
+    # Print header
+    print(f"\n{'='*55}")
+    print(f"  BalaRL PPO Training")
+    print(f"  Run:      {run_id}")
+    print(f"  Steps:    {config.total_timesteps:,}")
+    print(f"  Envs:     {config.n_envs} ({type(env).__name__})")
+    print(f"  n_steps:  {config.n_steps}")
+    print(f"  Batch:    {config.batch_size} x {config.n_epochs} epochs")
+    print(f"  Device:   {config.device}")
+    print(f"  Dim:      {config.features_dim}")
+    print(f"  Save:     {save_path}")
+    print(f"  Platform: {platform.system()} {platform.machine()}")
+    if torch.cuda.is_available():
+        print(f"  GPU:      {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory // 2**30}GB)")
+    print(f"{'='*55}\n")
 
     t_start = time.perf_counter()
+    model._start_time = t_start
 
     try:
         model.learn(
             total_timesteps=config.total_timesteps,
             callback=CallbackList(callbacks),
-            log_interval=10,
-            progress_bar=config.progress_bar,
+            log_interval=200,
+            progress_bar=False,
         )
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
+        print("\n  Training interrupted by user", flush=True)
 
     elapsed = time.perf_counter() - t_start
 
@@ -181,11 +231,7 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
     final_model_path = save_path / "ppo_final"
     model.save(str(final_model_path))
 
-    print(f"\nTraining complete: {elapsed:.0f}s ({config.total_timesteps:,} steps)")
-    print(f"Model saved to: {final_model_path}")
-
-    # Quick final eval
-    mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=10, deterministic=True)
-    print(f"Final eval: {mean_reward:.1f} +/- {std_reward:.1f}")
+    print(f"\n  Done: {elapsed:.0f}s ({config.total_timesteps:,} steps)")
+    print(f"  Model: {final_model_path}", flush=True)
 
     return model, save_path

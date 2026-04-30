@@ -2,65 +2,68 @@
 """Entry point for training a PPO agent on Balatro.
 
 Usage:
-    python -m balarl.scripts.train --quick-test    # 10k step smoke test
-    python -m balarl.scripts.train --timesteps 1e6 # Custom timesteps
-    python -m balarl.scripts.train --full          # Full training run
+    python -u -m balarl.scripts.train --quick-test     # 5k step smoke test
+    python -u -m balarl.scripts.train --server          # Server-optimized: SubprocVecEnv, 5M steps
+    python -u -m balarl.scripts.train --timesteps 1e6   # Custom steps
 """
 
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 
 from balarl.training.ppo_train import train_ppo
-from balarl.training.config import TrainingConfig, QUICK_TEST_CONFIG, SERVER_TRAIN_CONFIG
+from balarl.training.config import TrainingConfig, QUICK_TEST_CONFIG
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO agent on Balatro")
-    parser.add_argument("--quick-test", action="store_true", help="Run 10k step smoke test")
-    parser.add_argument("--full", action="store_true", help="Run full training (10M steps)")
-    parser.add_argument("--timesteps", type=int, default=None, help="Total training timesteps")
-    parser.add_argument("--n-envs", type=int, default=None, help="Number of parallel environments")
+    parser.add_argument("--quick-test", action="store_true", help="Smoke test (5K steps)")
+    parser.add_argument("--server", action="store_true", help="Server-optimized training")
+    parser.add_argument("--timesteps", type=int, default=None, help="Total timesteps")
+    parser.add_argument("--n-envs", type=int, default=None, help="Parallel environments")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
-    parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum learning")
-    parser.add_argument("--device", type=str, default="cpu", help="Device (cpu/cuda)")
+    parser.add_argument("--device", type=str, default=None, help="cpu/cuda")
     parser.add_argument("--log-dir", type=str, default="logs", help="Log directory")
     parser.add_argument("--model-dir", type=str, default="models", help="Model save directory")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum")
     args = parser.parse_args()
 
     if args.quick_test:
-        config = QUICK_TEST_CONFIG
-    elif args.full:
-        config = SERVER_TRAIN_CONFIG
+        config = TrainingConfig(
+            total_timesteps=5_000, n_envs=2, n_steps=256, batch_size=32, n_epochs=4,
+            features_dim=128, net_arch_pi=[64, 64], net_arch_vf=[64, 64],
+            checkpoint_freq=10_000, log_freq=500, save_freq=5_000,
+            device=args.device or "cpu",
+        )
+    elif args.server:
+        is_linux = platform.system() == "Linux"
+        config = TrainingConfig(
+            total_timesteps=5_000_000, n_envs=8 if is_linux else 4,
+            n_steps=2048, batch_size=128, n_epochs=10,
+            learning_rate=3e-4,
+            features_dim=512, net_arch_pi=[256, 256], net_arch_vf=[256, 256],
+            checkpoint_freq=50_000, log_freq=2_000, save_freq=100_000,
+            use_curriculum=True,
+            device=args.device or ("cuda" if is_linux else "cpu"),
+        )
     else:
         config = TrainingConfig()
 
-    # Override from command line
-    if args.timesteps is not None:
-        config.total_timesteps = args.timesteps
-    if args.n_envs is not None:
-        config.n_envs = args.n_envs
-    if args.lr is not None:
-        config.learning_rate = args.lr
-    if args.no_curriculum:
-        config.use_curriculum = False
-    if args.device:
-        config.device = args.device
-    if args.log_dir:
-        config.log_dir = args.log_dir
-        config.tensorboard_log = f"{args.log_dir}/tensorboard"
-    if args.model_dir:
-        config.model_dir = args.model_dir
-    if args.seed is not None:
-        config.seed = args.seed
-
-    print(f"Training mode: {'quick test' if args.quick_test else 'full' if args.full else 'custom'}")
-    print(f"Config: {config.total_timesteps:,} steps, {config.n_envs} envs, lr={config.learning_rate}")
+    # CLI overrides
+    if args.timesteps: config.total_timesteps = args.timesteps
+    if args.n_envs: config.n_envs = args.n_envs
+    if args.lr: config.learning_rate = args.lr
+    if args.device: config.device = args.device
+    if args.log_dir: config.log_dir = args.log_dir
+    if args.model_dir: config.model_dir = args.model_dir
+    if args.seed is not None: config.seed = args.seed
+    if args.no_curriculum: config.use_curriculum = False
 
     model, path = train_ppo(config)
-    print(f"\nDone! Model saved to: {path}")
+    print(f"\nDone. Model: {path}")
     return 0
 
 
