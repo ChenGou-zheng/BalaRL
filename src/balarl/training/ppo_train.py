@@ -98,35 +98,62 @@ def _make_env_tuple(idx: int):
 class ProgressCallback(BaseCallback):
     """Print training metrics to stdout every N steps."""
 
-    def __init__(self, print_freq: int = 1000):
+    def __init__(self, print_freq: int = 2000, n_envs: int = 1):
         super().__init__()
         self.print_freq = print_freq
+        self._n_envs = n_envs
         self._last_print = 0
-        self._ep_count = 0
+        # Per-env accumulators
+        self._cumrew = np.zeros(n_envs, dtype=np.float64)
+        self._eplen = np.zeros(n_envs, dtype=np.int32)
+        self._cur_ante = np.ones(n_envs, dtype=np.int32)  # current ante per env
+        # Episode-level history
         self._ep_rewards: List[float] = []
+        self._ep_antes: List[int] = []
+        self._ep_lengths: List[int] = []
 
     def _on_step(self) -> bool:
-        if "dones" in self.locals:
-            dones = self.locals["dones"]
-            if isinstance(dones, np.ndarray):
-                dones = dones.tolist()
-            if not isinstance(dones, list):
-                dones = [dones]
+        rewards = np.asarray(self.locals["rewards"])
+        dones = np.asarray(self.locals["dones"])
+        new_obs = self.locals.get("new_obs", {})
+        n = min(len(dones), self._n_envs)
 
-            for done in dones:
-                if done:
-                    self._ep_count += 1
+        for i in range(n):
+            self._cumrew[i] += float(rewards[i])
+            self._eplen[i] += 1
+            if dones[i]:
+                # Capture episode data using cached ante (from previous step's new_obs)
+                self._ep_rewards.append(float(self._cumrew[i]))
+                self._ep_lengths.append(int(self._eplen[i]))
+                self._ep_antes.append(int(self._cur_ante[i]))
+                self._cumrew[i] = 0.0
+                self._eplen[i] = 0
 
+        # Update cached ante from latest observation (after processing dones,
+        # so the done-step's reset ante doesn't overwrite the captured value)
+        if isinstance(new_obs, dict) and "ante" in new_obs:
+            a = new_obs["ante"]
+            for i in range(n):
+                self._cur_ante[i] = int(a[i]) if a.ndim >= 1 else int(a)
+
+        # Print
         if self.num_timesteps - self._last_print >= self.print_freq:
             self._last_print = self.num_timesteps
-            elapsed = time.perf_counter() - getattr(self.model, '_start_time', time.perf_counter())
+            elapsed = time.perf_counter() - getattr(self.model, "_start_time", time.perf_counter())
             fps = int(self.num_timesteps / max(1, elapsed))
-            avg_reward = np.mean(self._ep_rewards[-20:]) if self._ep_rewards else 0.0
-            print(f"  [{self.num_timesteps:>10,} steps]  "
-                  f"fps={fps:>6}  "
-                  f"eps={self._ep_count:>6}  "
-                  f"reward={avg_reward:>8.1f}",
-                  flush=True)
+            n_recent = min(20, len(self._ep_rewards))
+            avg_rew = np.mean(self._ep_rewards[-n_recent:]) if n_recent else 0.0
+            avg_ante = np.mean(self._ep_antes[-n_recent:]) if n_recent else 0.0
+            avg_len = np.mean(self._ep_lengths[-n_recent:]) if n_recent else 0.0
+            print(
+                f"  [{self.num_timesteps:>10,} steps]  "
+                f"fps={fps:>6}  "
+                f"eps={len(self._ep_rewards):>6}  "
+                f"rew={avg_rew:>8.1f}  "
+                f"ante={avg_ante:>5.1f}  "
+                f"len={avg_len:>5.0f}",
+                flush=True,
+            )
         return True
 
 
@@ -188,7 +215,7 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
 
     # Callbacks
     callbacks = [
-        ProgressCallback(print_freq=config.log_freq),
+        ProgressCallback(print_freq=config.log_freq, n_envs=config.n_envs),
         CheckpointCallback(
             save_freq=config.checkpoint_freq,
             save_path=str(save_path / "checkpoints"),
