@@ -13,7 +13,7 @@ import argparse
 import sys
 
 from balarl.training.ppo_train import train_ppo
-from balarl.training.config import TrainingConfig, QUICK_TEST_CONFIG, FULL_TRAIN_CONFIG
+from balarl.training.config import TrainingConfig, QUICK_TEST_CONFIG, SERVER_TRAIN_CONFIG
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
     if args.quick_test:
         config = QUICK_TEST_CONFIG
     elif args.full:
-        config = FULL_TRAIN_CONFIG
+        config = SERVER_TRAIN_CONFIG
     else:
         config = TrainingConfig()
 
