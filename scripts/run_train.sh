@@ -46,6 +46,9 @@ echo "Device:    $DEVICE"
 echo "BC trajs:  $TRAJ_FILE"
 echo ""
 
+mkdir -p "logs/${RUN_NAME}"
+mkdir -p "models/${RUN_NAME}"
+
 nohup uv run python -u -m balarl.scripts.train \
     --server \
     --timesteps "$TIMESTEPS" \
