@@ -601,6 +601,7 @@ class BalatroEnv(gym.Env):
     def _on_blind_failed(self, current_reward: float, info: Dict) -> Tuple[float, bool, Dict]:
         progress = min(1.0, self.state.round_chips_scored / max(1, self.state.chips_needed))
         penalty = self.reward_shaper.blind_fail_penalty(progress)
+        ante_bonus = self.reward_shaper.ante_termination_bonus(self.state.ante)
 
         if self.state.has_joker("Mr. Bones") and progress >= 0.25:
             self.state.round_chips_scored = self.state.chips_needed
@@ -608,8 +609,9 @@ class BalatroEnv(gym.Env):
 
         self.state.game_over = True
         self.state.phase = "game_over"
-        reward = current_reward + penalty
+        reward = current_reward + penalty + ante_bonus
         info["blind_failed"] = True
+        info["ante"] = self.state.ante
         return reward, True, info
 
     def _advance_round(self):

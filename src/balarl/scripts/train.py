@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--model-dir", type=str, default="models", help="Model save directory")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum")
+    parser.add_argument("--bc-trajectories", type=str, default=None, help="Path to expert trajectory .pkl for BC warm-start")
+    parser.add_argument("--bc-epochs", type=int, default=50, help="BC pretraining epochs")
+    parser.add_argument("--bc-lr", type=float, default=1e-3, help="BC learning rate")
     args = parser.parse_args()
 
     if args.quick_test:
@@ -62,7 +65,12 @@ def main():
     if args.seed is not None: config.seed = args.seed
     if args.no_curriculum: config.use_curriculum = False
 
-    model, path = train_ppo(config)
+    model, path = train_ppo(
+        config,
+        bc_trajectories_path=args.bc_trajectories,
+        bc_epochs=args.bc_epochs,
+        bc_lr=args.bc_lr,
+    )
     print(f"\nDone. Model: {path}")
     return 0
 

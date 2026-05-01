@@ -7,7 +7,7 @@ import platform
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -22,6 +22,7 @@ from stable_baselines3.common.callbacks import (
 from balarl.env.balatro_env import BalatroEnv
 from balarl.training.feature_extractor import BalatroFeatureExtractor
 from balarl.training.config import TrainingConfig
+from balarl.training.bc_pretrain import load_trajectories, pretrain_bc
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,11 +74,9 @@ def create_vec_env(n_envs: int, seed: int, max_ante: int = 8) -> gym.vector.Vect
     if IS_LINUX and n_envs > 1:
         # Use "fork" start method for speed on Linux
         try:
-            import multiprocessing as mp
-            ctx = mp.get_context("fork")
             return SubprocVecEnv(
                 [_make_env_tuple(idx) for idx in range(n_envs)],
-                context=ctx,
+                start_method="fork",
             )
         except Exception as e:
             print(f"  SubprocVecEnv failed ({e}), falling back to DummyVecEnv")
@@ -161,7 +160,20 @@ class ProgressCallback(BaseCallback):
 # Main training function
 # ═══════════════════════════════════════════════════════════════
 
-def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
+def train_ppo(
+    config: TrainingConfig,
+    bc_trajectories_path: str | None = None,
+    bc_epochs: int = 50,
+    bc_lr: float = 1e-3,
+) -> tuple[PPO, Path]:
+    """Run PPO training on Balatro.
+
+    Args:
+        config: Training configuration.
+        bc_trajectories_path: Path to expert .pkl trajectories for BC warm-start.
+        bc_epochs: BC pretraining epochs.
+        bc_lr: BC learning rate.
+    """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = Path(config.model_dir) / f"ppo_{run_id}"
     save_path.mkdir(parents=True, exist_ok=True)
@@ -212,6 +224,21 @@ def train_ppo(config: TrainingConfig) -> tuple[PPO, Path]:
         device=config.device,
         verbose=0,  # We handle our own logging
     )
+
+    # BC pretraining warm-start
+    if bc_trajectories_path and Path(bc_trajectories_path).exists():
+        print(f"  Loading expert trajectories: {bc_trajectories_path}", flush=True)
+        trajs = load_trajectories(bc_trajectories_path)
+        print(f"  Loaded {len(trajs)} trajectories ({sum(t['steps'] for t in trajs):,} steps total)", flush=True)
+        stats = pretrain_bc(
+            model, trajs,
+            n_epochs=bc_epochs,
+            batch_size=256,
+            learning_rate=bc_lr,
+            device=config.device,
+            verbose=True,
+        )
+        print(f"  BC accuracy: {stats.get('accuracy', 0):.1%}", flush=True)
 
     # Callbacks
     callbacks = [

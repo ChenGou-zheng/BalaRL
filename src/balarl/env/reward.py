@@ -106,7 +106,10 @@ class RewardShaper:
         return min(50.0, 20.0 + 10.0 * ante)
 
     def blind_fail_penalty(self, progress: float) -> float:
-        return -50.0 * (1.0 - progress)
+        return -20.0 * (1.0 - progress)
+
+    def ante_termination_bonus(self, final_ante: int) -> float:
+        return 10.0 * final_ante
 
     def shop_buy_reward(self, item_type: str) -> float:
         rewards = {"JOKER": 2.0, "PACK": 1.0, "CARD": 0.5, "VOUCHER": 3.0}
